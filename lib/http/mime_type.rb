@@ -1,51 +1,76 @@
 module HTTP
-  # Yes, HTTP bundles its own MIME type library. Maybe it should be spun off
-  # as a separate gem or something.
-  class MimeType
-    @mime_types, @shortcuts = {}, {}
-
+  # MIME type encode/decode adapters
+  module MimeType
     class << self
-      def register(obj)
-        @mime_types[obj.type] = obj
-        @shortcuts[obj.shortcut] = obj if obj.shortcut
+      # Associate MIME type with adapter
+      #
+      # @example
+      #
+      #   module JsonAdapter
+      #     class << self
+      #       def encode(obj)
+      #         # encode logic here
+      #       end
+      #
+      #       def decode(str)
+      #         # decode logic here
+      #       end
+      #     end
+      #   end
+      #
+      #   HTTP::MimeType.register_adapter 'application/json', MyJsonAdapter
+      #
+      # @param [#to_s] type
+      # @param [#encode, #decode] adapter
+      # @return [void]
+      def register_adapter(type, adapter)
+        adapters[type.to_s] = adapter
       end
 
+      # Returns adapter associated with MIME type
+      #
+      # @param [#to_s] type
+      # @raise [Error] if no adapter found
+      # @return [void]
       def [](type)
-        if type.is_a? Symbol
-          @shortcuts[type]
-        else
-          @mime_types[type]
-        end
+        adapters[normalize type] || fail(Error, "Unknown MIME type: #{type}")
       end
-    end
 
-    attr_reader :type, :shortcut
+      # Register a shortcut for MIME type
+      #
+      # @example
+      #
+      #   HTTP::MimeType.register_alias 'application/json', :json
+      #
+      # @param [#to_s] type
+      # @param [#to_sym] shortcut
+      # @return [void]
+      def register_alias(type, shortcut)
+        aliases[shortcut.to_sym] = type.to_s
+      end
 
-    def initialize(type, shortcut = nil)
-      @type, @shortcut = type, shortcut
-      @parse_with = @emit_with = nil
+      # Resolves type by shortcut if possible
+      #
+      # @param [#to_s] type
+      # @return [String]
+      def normalize(type)
+        aliases.fetch type, type.to_s
+      end
 
-      self.class.register self
-    end
+    private
 
-    # Define
-    def parse_with(&block)
-      @parse_with = block
-    end
+      # :nodoc:
+      def adapters
+        @adapters ||= {}
+      end
 
-    def emit_with(&block)
-      @emit_with = block
-    end
-
-    def parse(obj)
-      @parse_with ? @parse_with[obj] : obj
-    end
-
-    def emit(obj)
-      @emit_with  ? @emit_with[obj]  : obj
+      # :nodoc:
+      def aliases
+        @aliases ||= {}
+      end
     end
   end
 end
 
-# MIME type registry
-require 'http/mime_types/json'
+# built-in mime types
+require 'http/mime_type/json'

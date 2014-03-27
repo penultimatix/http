@@ -1,4 +1,5 @@
 require 'http/options'
+require 'http/redirector'
 require 'uri'
 
 module HTTP
@@ -6,118 +7,148 @@ module HTTP
   class Client
     include Chainable
 
-    BUFFER_SIZE = 4096 # Input buffer size
+    # Input buffer size
+    BUFFER_SIZE = 16_384
 
     attr_reader :default_options
 
     def initialize(default_options = {})
       @default_options = HTTP::Options.new(default_options)
-    end
-
-    def body(opts, headers)
-      if opts.body
-        body = opts.body
-      elsif opts.form
-        headers['Content-Type'] ||= 'application/x-www-form-urlencoded'
-        body = URI.encode_www_form(opts.form)
-      end
+      @parser = HTTP::Response::Parser.new
+      @socket = nil
     end
 
     # Make an HTTP request
-    def request(method, uri, options = {})
+    def request(verb, uri, options = {})
       opts = @default_options.merge(options)
-      host = URI.parse(uri).host
-      opts.headers["Host"] = host
       headers = opts.headers
       proxy = opts.proxy
 
-      method_body = body(opts, headers)
-      if opts.params
-        uri="#{uri}?#{URI.encode_www_form(opts.params)}"
-      end
+      request_body = make_request_body(opts, headers)
+      uri, opts = normalize_get_params(uri, opts) if verb == :get
 
-      request = HTTP::Request.new method, uri, headers, proxy, method_body
-      if opts.follow
-        code = 302
-        while code == 302 or code == 301
-          # if the uri isn't fully formed complete it
-          if not uri.match(/\./)
-            uri = "#{method}://#{host}#{uri}"
-          end
-          host = URI.parse(uri).host
-          opts.headers["Host"] = host
-          method_body = body(opts, headers)
-          request = HTTP::Request.new method, uri, headers, proxy, method_body
-          response = perform request, opts
-          code = response.code
-          uri = response.headers["Location"]
-        end
-      end
+      uri = "#{uri}?#{URI.encode_www_form(opts.params)}" if opts.params && !opts.params.empty?
 
-      opts.callbacks[:request].each { |c| c.call(request) }
-      response = perform request, opts
-      opts.callbacks[:response].each { |c| c.call(response) }
-
-      format_response method, response, opts.response
+      request = HTTP::Request.new(verb, uri, headers, proxy, request_body)
+      perform request, opts
     end
 
-    def perform(request, options)
-      parser = HTTP::Response::Parser.new
-      uri = request.uri
-      socket = options[:socket_class].open(uri.host, uri.port) # TODO: proxy support
+    # Perform the HTTP request (following redirects if needed)
+    def perform(req, options)
+      res = perform_without_following_redirects req, options
 
-      if uri.is_a?(URI::HTTPS)
-        if options[:ssl_context] == nil
-          context = OpenSSL::SSL::SSLContext.new
-        else
-          context = options[:ssl_context]
+      if options.follow
+        res = Redirector.new(options.follow).perform req, res do |request|
+          # TODO: keep-alive
+          @parser.reset
+          finish_response
+
+          perform_without_following_redirects request, options
         end
-        socket = options[:ssl_socket_class].new(socket, context)
-        socket.connect
       end
 
-      request.stream socket
+      @body_remaining = Integer(res['Content-Length']) if res['Content-Length']
+      res
+    end
+
+    # Read a chunk of the body
+    def readpartial(size = BUFFER_SIZE) # rubocop:disable CyclomaticComplexity
+      if @parser.finished? || (@body_remaining && @body_remaining.zero?)
+        chunk = @parser.chunk
+
+        if !chunk && @body_remaining && !@body_remaining.zero?
+          fail StateError, "expected #{@body_remaining} more bytes of body"
+        end
+
+        @body_remaining -= chunk.bytesize if chunk
+        return chunk
+      end
+
+      fail StateError, 'not connected' unless @socket
+
+      chunk = @parser.chunk
+      unless chunk
+        begin
+          @parser << @socket.readpartial(BUFFER_SIZE)
+          chunk = @parser.chunk
+        rescue EOFError
+          chunk = nil
+        end
+
+        # TODO: consult @body_remaining here and raise if appropriate
+        return unless chunk
+      end
+
+      if @body_remaining
+        @body_remaining -= chunk.bytesize
+        @body_remaining = nil if @body_remaining < 1
+      end
+
+      finish_response if @parser.finished?
+      chunk
+    end
+
+  private
+
+    # Perform a single (no follow) HTTP request
+    def perform_without_following_redirects(req, options)
+      uri = req.uri
+
+      # TODO: keep-alive support
+      @socket = options[:socket_class].open(req.socket_host, req.socket_port)
+      @socket = start_tls(@socket, options) if uri.is_a?(URI::HTTPS)
+
+      req.stream @socket
 
       begin
-        parser << socket.readpartial(BUFFER_SIZE) until parser.headers
+        @parser << @socket.readpartial(BUFFER_SIZE) until @parser.headers
       rescue IOError, Errno::ECONNRESET, Errno::EPIPE => ex
         raise IOError, "problem making HTTP request: #{ex}"
       end
 
-      response = HTTP::Response.new(parser.status_code, parser.http_version, parser.headers) do
-        if !parser.finished? || (@body_remaining && @body_remaining > 0)
-          chunk = parser.chunk || begin
-            parser << socket.readpartial(BUFFER_SIZE)
-            parser.chunk || ""
-          end
-
-          @body_remaining -= chunk.length if @body_remaining
-          @body_remaining = nil if @body_remaining && @body_remaining < 1
-
-          chunk
-        end
-      end
-
-      @body_remaining = Integer(response['Content-Length']) if response['Content-Length']
-      response
+      body = Response::Body.new(self)
+      Response.new(@parser.status_code, @parser.http_version, @parser.headers, body, uri)
     end
 
-    def format_response(method, response, option)
-      case option
-      when :auto, NilClass
-        if method == :head
-          response
-        else
-          HTTP::Response::BodyDelegator.new(response, response.parse_body)
-        end
-      when :object
-        response
-      when :parsed_body
-        HTTP::Response::BodyDelegator.new(response, response.parse_body)
-      when :body
-        HTTP::Response::BodyDelegator.new(response)
-      else raise ArgumentError, "invalid response type: #{option}"
+    # Initialize TLS connection
+    def start_tls(socket, options)
+      # TODO: abstract away SSLContexts so we can use other TLS libraries
+      context = options[:ssl_context] || OpenSSL::SSL::SSLContext.new
+      socket  = options[:ssl_socket_class].new(socket, context)
+
+      socket.connect
+      socket
+    end
+
+    # Create the request body object to send
+    def make_request_body(opts, headers)
+      if opts.body
+        opts.body
+      elsif opts.form
+        headers['Content-Type'] ||= 'application/x-www-form-urlencoded'
+        URI.encode_www_form(opts.form)
+      elsif opts.json
+        headers['Content-Type'] ||= 'application/json'
+        MimeType[:json].encode opts.json
       end
+    end
+
+    # Callback for when we've reached the end of a response
+    def finish_response
+      # TODO: keep-alive support
+      @socket = nil
+    end
+
+    # Moves uri get params into the opts.params hash
+    # @return [Array<URI, Hash>]
+    def normalize_get_params(uri, opts)
+      uri = URI(uri) unless uri.is_a?(URI)
+      if uri.query
+        extracted_params_from_uri = Hash[URI.decode_www_form(uri.query)]
+        opts = opts.with_params(extracted_params_from_uri.merge(opts.params || {}))
+        uri.query = nil
+      end
+      [uri, opts]
     end
   end
 end

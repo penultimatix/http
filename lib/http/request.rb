@@ -1,13 +1,18 @@
-require 'http/header'
-require 'http/request_stream'
+require 'http/headers'
+require 'http/request/writer'
+require 'http/version'
 require 'uri'
+require 'base64'
 
 module HTTP
   class Request
-    include HTTP::Header
+    include HTTP::Headers::Mixin
 
     # The method given was not understood
-    class UnsupportedMethodError < ArgumentError; end
+    class UnsupportedMethodError < RequestError; end
+
+    # The scheme of given URI was not understood
+    class UnsupportedSchemeError < RequestError; end
 
     # RFC 2616: Hypertext Transfer Protocol -- HTTP/1.1
     METHODS = [:options, :get, :head, :post, :put, :delete, :trace, :connect]
@@ -27,45 +32,97 @@ module HTTP
     # draft-reschke-webdav-search: WebDAV Search
     METHODS.concat [:search]
 
+    # Allowed schemes
+    SCHEMES = [:http, :https, :ws, :wss]
+
     # Method is given as a lowercase symbol e.g. :get, :post
-    attr_reader :method
+    attr_reader :verb
+
+    # Scheme is normalized to be a lowercase symbol e.g. :http, :https
+    attr_reader :scheme
+
+    # The following alias may be removed in three minor versions (0.8.0) or one
+    # major version (1.0.0)
+    alias_method :__method__, :method
+
+    # The following method may be removed in two minor versions (0.7.0) or one
+    # major version (1.0.0)
+    def method(*args)
+      warn "#{Kernel.caller.first}: [DEPRECATION] HTTP::Request#method is deprecated. Use #verb instead. For Object#method, use #__method__."
+      @verb
+    end
 
     # "Request URI" as per RFC 2616
     # http://www.w3.org/Protocols/rfc2616/rfc2616-sec5.html
     attr_reader :uri
-    attr_reader :headers, :proxy, :body, :version
+    attr_reader :proxy, :body, :version
 
     # :nodoc:
-    def initialize(method, uri, headers = {}, proxy = {}, body = nil, version = "1.1")
-      @method = method.to_s.downcase.to_sym
-      raise UnsupportedMethodError, "unknown method: #{method}" unless METHODS.include? @method
+    def initialize(verb, uri, headers = {}, proxy = {}, body = nil, version = '1.1') # rubocop:disable ParameterLists
+      @verb   = verb.to_s.downcase.to_sym
+      @uri    = uri.is_a?(URI) ? uri : URI(uri.to_s)
+      @scheme = @uri.scheme.to_s.downcase.to_sym if @uri.scheme
 
-      @uri = uri.is_a?(URI) ? uri : URI(uri.to_s)
-
-      @headers = {}
-      headers.each do |name, value|
-        name = name.to_s
-        key = name[CANONICAL_HEADER]
-        key ||= canonicalize_header(name)
-        @headers[key] = value
-      end
-      @headers["Host"] ||= @uri.host
+      fail(UnsupportedMethodError, "unknown method: #{verb}") unless METHODS.include?(@verb)
+      fail(UnsupportedSchemeError, "unknown scheme: #{scheme}") unless SCHEMES.include?(@scheme)
 
       @proxy, @body, @version = proxy, body, version
+
+      @headers = HTTP::Headers.coerce(headers || {})
+
+      @headers['Host']        ||= @uri.host
+      @headers['User-Agent']  ||= "RubyHTTPGem/#{HTTP::VERSION}"
     end
 
-    # Obtain the given header
-    def [](header)
-      @headers[canonicalize_header(header)]
+    # Returns new Request with updated uri
+    def redirect(uri, verb = @verb)
+      uri = @uri.merge uri.to_s
+      req = self.class.new(verb, uri, headers, proxy, body, version)
+      req['Host'] = req.uri.host
+      req
     end
 
     # Stream the request to a socket
     def stream(socket)
-      path = uri.query ? "#{uri.path}?#{uri.query}" : uri.path
-      path = "/" if path.empty?
-      request_header = "#{method.to_s.upcase} #{path} HTTP/#{version}"
-      rs = HTTP::RequestStream.new socket, body, @headers, request_header
-      rs.stream
+      include_proxy_authorization_header if using_authenticated_proxy?
+      Request::Writer.new(socket, body, headers, request_header).stream
+    end
+
+    # Is this request using a proxy?
+    def using_proxy?
+      proxy && proxy.keys.size >= 2
+    end
+
+    # Is this request using an authenticated proxy?
+    def using_authenticated_proxy?
+      proxy && proxy.keys.size == 4
+    end
+
+    # Compute and add the Proxy-Authorization header
+    def include_proxy_authorization_header
+      digest = Base64.encode64("#{proxy[:proxy_username]}:#{proxy[:proxy_password]}").chomp
+      headers['Proxy-Authorization'] = "Basic #{digest}"
+    end
+
+    # Compute HTTP request header for direct or proxy request
+    def request_header
+      if using_proxy?
+        "#{verb.to_s.upcase} #{uri} HTTP/#{version}"
+      else
+        path = uri.query && !uri.query.empty? ? "#{uri.path}?#{uri.query}" : uri.path
+        path = '/' if path.empty?
+        "#{verb.to_s.upcase} #{path} HTTP/#{version}"
+      end
+    end
+
+    # Host for tcp socket
+    def socket_host
+      using_proxy? ? proxy[:proxy_address] : uri.host
+    end
+
+    # Port for tcp socket
+    def socket_port
+      using_proxy? ? proxy[:proxy_port] : uri.port
     end
   end
 end

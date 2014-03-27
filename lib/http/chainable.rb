@@ -1,3 +1,5 @@
+require 'http/authorization_header'
+
 module HTTP
   module Chainable
     # Request a get sans response body
@@ -50,34 +52,26 @@ module HTTP
       branch(options).request verb, uri
     end
 
-    # Make a request invoking the given event callbacks
-    def on(event, &block)
-      branch default_options.with_callback(event, block)
-    end
-
     # Make a request through an HTTP proxy
     def via(*proxy)
       proxy_hash = {}
-      proxy_hash[:proxy_address] = proxy[0] if proxy[0].is_a? String
-      proxy_hash[:proxy_port]    = proxy[1] if proxy[1].is_a? Integer
-      proxy_hash[:proxy_username]= proxy[2] if proxy[2].is_a? String
-      proxy_hash[:proxy_password]= proxy[3] if proxy[3].is_a? String
+      proxy_hash[:proxy_address]  = proxy[0] if proxy[0].is_a?(String)
+      proxy_hash[:proxy_port]     = proxy[1] if proxy[1].is_a?(Integer)
+      proxy_hash[:proxy_username] = proxy[2] if proxy[2].is_a?(String)
+      proxy_hash[:proxy_password] = proxy[3] if proxy[3].is_a?(String)
 
-      if proxy_hash.keys.size >=2
+      if [2, 4].include?(proxy_hash.keys.size)
         branch default_options.with_proxy(proxy_hash)
       else
-        raise ArgumentError, "invalid HTTP proxy: #{proxy_hash}"
+        fail(RequestError, "invalid HTTP proxy: #{proxy_hash}")
       end
     end
     alias_method :through, :via
 
-    # Specify the kind of response to return (:auto, :object, :body, :parsed_body)
-    def with_response(response_type)
-      branch default_options.with_response(response_type)
-    end
-
     # Alias for with_response(:object)
-    def stream; with_response(:object); end
+    def stream
+      with_response(:object)
+    end
 
     def with_follow(follow)
       branch default_options.with_follow(follow)
@@ -91,13 +85,18 @@ module HTTP
 
     # Accept the given MIME type(s)
     def accept(type)
-      if type.is_a? String
-        with :accept => type
-      else
-        mime_type = HTTP::MimeType[type]
-        raise ArgumentError, "unknown MIME type: #{type}" unless mime_type
-        with :accept => mime_type.type
-      end
+      with :accept => MimeType.normalize(type)
+    end
+
+    # Make a request with the given Authorization header
+    def auth(*args)
+      value = case args.count
+              when 1 then args.first
+              when 2 then AuthorizationHeader.build(*args)
+              else fail ArgumentError, "wrong number of arguments (#{args.count} for 1..2)"
+              end
+
+      with :authorization => value.to_s
     end
 
     def default_options
@@ -128,7 +127,7 @@ module HTTP
       end
     end
 
-    private
+  private
 
     def branch(options)
       HTTP::Client.new(options)

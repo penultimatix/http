@@ -1,9 +1,11 @@
 require 'delegate'
-require 'http/header'
+require 'http/headers'
+require 'http/content_type'
+require 'http/mime_type'
 
 module HTTP
   class Response
-    include HTTP::Header
+    include HTTP::Headers::Mixin
 
     STATUS_CODES = {
       100 => 'Continue',
@@ -65,96 +67,65 @@ module HTTP
     SYMBOL_TO_STATUS_CODE.freeze
 
     attr_reader :status
-    attr_reader :headers
+    attr_reader :body
+    attr_reader :uri
 
     # Status aliases! TIMTOWTDI!!! (Want to be idiomatic? Just use status :)
     alias_method :code,        :status
     alias_method :status_code, :status
 
-    def initialize(status = nil, version = "1.1", headers = {}, body = nil, &body_proc)
-      @status, @version, @body, @body_proc = status, version, body, body_proc
-
-      @headers = {}
-      headers.each do |field, value|
-        @headers[canonicalize_header(field)] = value
-      end
-    end
-
-    # Set a header
-    def []=(name, value)
-      # If we have a canonical header, we're done
-      key = name[CANONICAL_HEADER]
-
-      # Convert to canonical capitalization
-      key ||= canonicalize_header(name)
-
-      # Check if the header has already been set and group
-      old_value = @headers[key]
-      if old_value
-        @headers[key] = [old_value].flatten << key
-      else
-        @headers[key] = value
-      end
+    def initialize(status, version, headers, body, uri = nil) # rubocop:disable ParameterLists
+      @status, @version, @body, @uri = status, version, body, uri
+      @headers = HTTP::Headers.coerce(headers || {})
     end
 
     # Obtain the 'Reason-Phrase' for the response
     def reason
-      # FIXME: should get the real reason phrase from the parser
       STATUS_CODES[@status]
-    end
-
-    # Get a header value
-    def [](name)
-      @headers[name] || @headers[canonicalize_header(name)]
-    end
-
-    # Obtain the response body
-    def body
-      @body ||= begin
-        raise "no body available for this response" unless @body_proc
-
-        body = "" unless block_given?
-        while (chunk = @body_proc.call)
-          if block_given?
-            yield chunk
-          else
-            body << chunk
-          end
-        end
-        body unless block_given?
-      end
-    end
-
-    # Parse the response body according to its content type
-    def parse_body
-      if @headers['Content-Type']
-        mime_type = MimeType[@headers['Content-Type'].split(/;\s*/).first]
-        return mime_type.parse(body) if mime_type
-      end
-
-      body
     end
 
     # Returns an Array ala Rack: `[status, headers, body]`
     def to_a
-      [status, headers, parse_body]
+      [status, headers.to_h, body.to_s]
+    end
+
+    # Return the response body as a string
+    def to_s
+      body.to_s
+    end
+    alias_method :to_str, :to_s
+
+    # Parsed Content-Type header
+    # @return [HTTP::ContentType]
+    def content_type
+      @content_type ||= ContentType.parse headers['Content-Type']
+    end
+
+    # MIME type of response (if any)
+    # @return [String, nil]
+    def mime_type
+      @mime_type ||= content_type.mime_type
+    end
+
+    # Charset of response (if any)
+    # @return [String, nil]
+    def charset
+      @charset ||= content_type.charset
+    end
+
+    # Parse response body with corresponding MIME type adapter.
+    #
+    # @param [#to_s] as Parse as given MIME type
+    #   instead of the one determined from headers
+    # @raise [Error] if adapter not found
+    # @return [Object]
+    def parse(as = nil)
+      MimeType[as || mime_type].decode to_s
     end
 
     # Inspect a response
     def inspect
-      "#<#{self.class}/#{@version} #{status} #{reason} @headers=#{@headers.inspect}>"
-    end
-
-    class BodyDelegator < ::Delegator
-      attr_reader :response
-
-      def initialize(response, body = response.body)
-        super(body)
-        @response, @body = response, body
-      end
-
-      def __getobj__; @body; end
-      def __setobj__(obj); @body = obj; end
+      "#<#{self.class}/#{@version} #{status} #{reason} headers=#{headers.inspect}>"
     end
   end
 end

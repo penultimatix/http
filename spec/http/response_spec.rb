@@ -1,56 +1,85 @@
 require 'spec_helper'
 
 describe HTTP::Response do
-  describe "headers" do
-    subject { HTTP::Response.new(200, "1.1", "Content-Type" => "text/plain") }
+  it 'includes HTTP::Headers::Mixin' do
+    expect(described_class).to include HTTP::Headers::Mixin
+  end
 
-    it "exposes header fields for easy access" do
-      expect(subject["Content-Type"]).to eq("text/plain")
-    end
+  describe 'to_a' do
+    let(:body)         { 'Hello world' }
+    let(:content_type) { 'text/plain' }
+    subject { HTTP::Response.new(200, '1.1', {'Content-Type' => content_type}, body) }
 
-    it "provides a #headers accessor too" do
-      expect(subject.headers).to eq("Content-Type" => "text/plain")
+    it 'returns a Rack-like array' do
+      expect(subject.to_a).to eq([200, {'Content-Type' => content_type}, body])
     end
   end
 
-  describe "#parse_body" do
-    context "on a registered MIME type" do
-      let(:body) { ::JSON.dump("Hello" => "World") }
-      subject { HTTP::Response.new(200, "1.1", {"Content-Type" => "application/json"}, body) }
+  describe 'mime_type' do
+    subject { HTTP::Response.new(200, '1.1', headers, '').mime_type }
 
-      it "returns a parsed response body" do
-        expect(subject.parse_body).to eq ::JSON.parse(body)
-      end
+    context 'without Content-Type header' do
+      let(:headers) { {} }
+      it { should be_nil }
     end
 
-    context "on an unregistered MIME type" do
-      let(:body) { "Hello world" }
-      subject { HTTP::Response.new(200, "1.1", {"Content-Type" => "text/plain"}, body) }
+    context 'with Content-Type: text/html' do
+      let(:headers) { {'Content-Type' => 'text/html'} }
+      it { should eq 'text/html' }
+    end
 
-      it "returns the raw body as a String" do
-        expect(subject.parse_body).to eq(body)
-      end
+    context 'with Content-Type: text/html; charset=utf-8' do
+      let(:headers) { {'Content-Type' => 'text/html; charset=utf-8'} }
+      it { should eq 'text/html' }
     end
   end
 
-  describe "to_a" do
-    context "on a registered MIME type" do
-      let(:body) { ::JSON.dump("Hello" => "World") }
-      let(:content_type) { "application/json" }
-      subject { HTTP::Response.new(200, "1.1", {"Content-Type" => content_type}, body) }
+  describe 'charset' do
+    subject { HTTP::Response.new(200, '1.1', headers, '').charset }
 
-      it "retuns a Rack-like array with a parsed response body" do
-        expect(subject.to_a).to eq([200, {"Content-Type" => content_type}, ::JSON.parse(body)])
+    context 'without Content-Type header' do
+      let(:headers) { {} }
+      it { should be_nil }
+    end
+
+    context 'with Content-Type: text/html' do
+      let(:headers) { {'Content-Type' => 'text/html'} }
+      it { should be_nil }
+    end
+
+    context 'with Content-Type: text/html; charset=utf-8' do
+      let(:headers) { {'Content-Type' => 'text/html; charset=utf-8'} }
+      it { should eq 'utf-8' }
+    end
+  end
+
+  describe '#parse' do
+    let(:headers)   { {'Content-Type' => content_type} }
+    let(:body)      { '{"foo":"bar"}' }
+    let(:response)  { HTTP::Response.new 200, '1.1', headers, body }
+
+    context 'with known content type' do
+      let(:content_type) { 'application/json' }
+      it 'returns parsed body' do
+        expect(response.parse).to eq 'foo' => 'bar'
       end
     end
 
-    context "on an unregistered MIME type" do
-      let(:body)         { "Hello world" }
-      let(:content_type) { "text/plain" }
-      subject { HTTP::Response.new(200, "1.1", {"Content-Type" => content_type}, body) }
+    context 'with unknown content type' do
+      let(:content_type) { 'application/deadbeef' }
+      it 'raises HTTP::Error' do
+        expect { response.parse }.to raise_error HTTP::Error
+      end
+    end
 
-      it "returns a Rack-like array" do
-        expect(subject.to_a).to eq([200, {"Content-Type" => content_type}, body])
+    context 'with explicitly given mime type' do
+      let(:content_type) { 'application/deadbeef' }
+      it 'ignores mime_type of response' do
+        expect(response.parse 'application/json').to eq 'foo' => 'bar'
+      end
+
+      it 'supports MIME type aliases' do
+        expect(response.parse :json).to eq 'foo' => 'bar'
       end
     end
   end
